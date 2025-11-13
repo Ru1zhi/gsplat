@@ -27,7 +27,581 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .utils import depth_to_normal, get_projection_matrix
+from .utils import depth_to_normal, get_projection_matrix, normalized_quat_to_rotmat
+
+
+def _decouple_normals(
+    scales: Tensor,  # [..., 3]
+    quats: Tensor,  # [..., 4]
+    view_dirs: Tensor,  # [..., 3]
+) -> Tuple[
+    Tensor,  # normals: Tensor [..., 3]
+    Tensor,  # min_scale: Tensor [...,]
+]:
+    batch_dims = scales.shape[:-1]
+    assert scales.shape == batch_dims + (3,), scales.shape
+    assert quats.shape == batch_dims + (4,), quats.shape
+    assert view_dirs.shape == batch_dims + (3,), view_dirs.shape
+
+    # * Get rotation matrices from quaternions
+    rotmats = normalized_quat_to_rotmat(F.normalize(quats, dim=-1))  # [..., 3, 3]
+
+    # * Select the axis with minimal scale as normal
+    min_scale, min_indices = torch.min(scales, dim=-1)  # [...,], [...,]
+    mesh = torch.meshgrid(
+        *[torch.arange(s, device=scales.device) for s in batch_dims], indexing="ij"
+    )
+    sel_idxs = tuple(mesh) + (min_indices,)
+    # selecte columns from rotmats
+    normals = rotmats.transpose(-1, -2)[sel_idxs]  # [..., 3]
+
+    # * Ensure the angles between normals and view_dirs are greater than 90 degrees
+    view_dirs = F.normalize(view_dirs, dim=-1)  # [..., 3]
+    cos_angles = torch.sum(normals * view_dirs, dim=-1, keepdim=True)  # [..., 1]
+    flip_signs = torch.where(cos_angles > 0, -1.0, 1.0)  # [..., 1]
+    normals = normals * flip_signs  # [..., 3]
+
+    # ! check angles
+    cos_angles = torch.sum(normals * view_dirs, dim=-1)
+    assert torch.all(
+        cos_angles <= 0
+    ), "Some angles between normals and view_dirs are not greater than 90 degrees."
+
+    return normals, min_scale
+
+
+def _distance_to_Gaussian_planes(
+    view_dirs: Tensor,  # [..., 3]
+    normals: Tensor,  # [..., 3] normals is in world space
+) -> Tensor:
+    batch_dims = view_dirs.shape[:-1]
+    assert view_dirs.shape == batch_dims + (3,), view_dirs.shape
+    assert normals.shape == batch_dims + (3,), normals.shape
+
+    distances = torch.sum(view_dirs * normals, dim=-1, keepdim=True)  # [..., 1]
+    distances = torch.abs(distances)  # [..., 1]
+
+    return distances
+
+
+def _depth_from_planes(
+    distance_maps: Tensor,
+    normal_maps: Tensor,
+    Ks: Tensor,
+) -> Tensor:
+    batch_dims = distance_maps.shape[:-3]
+    H, W = distance_maps.shape[-3:-1]
+    assert distance_maps.shape == batch_dims + (H, W, 1)
+    assert normal_maps.shape == batch_dims + (H, W, 3)
+    assert Ks.shape == batch_dims + (3, 3)
+
+    u, v = torch.meshgrid(
+        torch.arange(W, dtype=Ks.dtype, device=Ks.device) + 0.5,
+        torch.arange(H, dtype=Ks.dtype, device=Ks.device) + 0.5,
+        indexing="xy",
+    )
+    homo_pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1)  # [H, W, 3]
+    # broadcast homo_pixels as normal_map
+    homo_pixels = homo_pixels.reshape([1] * len(batch_dims) + [H, W, 3])
+    homo_pixels = homo_pixels.expand_as(normal_maps)  # [..., H, W, 3]
+
+    Ks_inv = torch.inverse(Ks)[..., None, None, :, :]  # [..., 1, 1, 3, 3]
+    Ks_inv = Ks_inv.expand(batch_dims + (H, W, 3, 3))  # [..., H, W, 3, 3]
+    rays = torch.matmul(Ks_inv, homo_pixels[..., None]).squeeze(-1)  # [..., H, W, 3]
+    denominator = torch.sum(normal_maps * rays, dim=-1, keepdim=True)  # [..., H, W, 1]
+    denominator = -denominator  # because the normal points towards the camera
+
+    depth_maps = distance_maps / denominator  # [..., H, W, 1]
+
+    return depth_maps
+
+
+def rasterization_pgsr(
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    opacities: Tensor,  # [..., N]
+    colors: Tensor,  # [..., (C,) N, D] or [..., (C,) N, K, 3]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    eps2d: float = 0.3,
+    sh_degree: Optional[int] = None,
+    packed: bool = False,
+    tile_size: int = 16,
+    backgrounds: Optional[Tensor] = None,
+    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB+D",
+    sparse_grad: bool = False,
+    absgrad: bool = False,
+    rasterize_mode: Literal["classic", "antialiased"] = "classic",
+    channel_chunk: int = 32,
+    distributed: bool = False,
+    camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
+    segmented: bool = False,
+    covars: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
+    """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C) according to `PGSR`.
+
+    `PGSR: Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction <https://arxiv.org/abs/2406.06521>`_.
+
+    This rasterization function only modifies the code implementation at the Python level in `rasterization()`.
+    It utilizes PyTorch's automatic differentiation to perform forward and backward computations for some intermediate variables,
+    thus its efficiency will be inferior to implementations at the CUDA level.
+
+    It only supports rendering "RGB+D" mode with "pinhole" camera model.
+    """
+
+    assert render_mode == "RGB+D"
+    assert camera_model == "pinhole", "PGSR only supports pinhole camera model."
+    # assert not packed, "PGSR does not support packed mode."
+
+    meta = {}
+
+    batch_dims = means.shape[:-2]
+    num_batch_dims = len(batch_dims)
+    B = math.prod(batch_dims)
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    I = B * C
+    device = means.device
+    assert means.shape == batch_dims + (N, 3), means.shape
+    if covars is None:
+        assert quats.shape == batch_dims + (N, 4), quats.shape
+        assert scales.shape == batch_dims + (N, 3), scales.shape
+    else:
+        assert covars.shape == batch_dims + (N, 3, 3), covars.shape
+        quats, scales = None, None
+        # convert covars from 3x3 matrix to upper-triangular 6D vector
+        tri_indices = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
+        covars = covars[..., tri_indices[0], tri_indices[1]]
+    assert opacities.shape == batch_dims + (N,), opacities.shape
+    assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
+    assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
+
+    def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
+        view_list = list(
+            map(
+                lambda x: x.split(int(x.shape[0] / C), dim=0),
+                world_view.split([C * N_i for N_i in N_world], dim=0),
+            )
+        )
+        return torch.stack([torch.cat(l, dim=0) for l in zip(*view_list)], dim=0)
+
+    if sh_degree is None:
+        # treat colors as post-activation values, should be in shape [..., N, D] or [..., C, N, D]
+        assert (
+            colors.dim() == num_batch_dims + 2
+            and colors.shape[:-1] == batch_dims + (N,)
+        ) or (
+            colors.dim() == num_batch_dims + 3
+            and colors.shape[:-1] == batch_dims + (C, N)
+        ), colors.shape
+        if distributed:
+            assert (
+                colors.dim() == num_batch_dims + 2
+            ), "Distributed mode only supports per-Gaussian colors."
+    else:
+        # treat colors as SH coefficients, should be in shape [..., N, K, 3] or [..., C, N, K, 3]
+        # Allowing for activating partial SH bands
+        assert (
+            colors.dim() == num_batch_dims + 3
+            and colors.shape[:-2] == batch_dims + (N,)
+            and colors.shape[-1] == 3
+        ) or (
+            colors.dim() == num_batch_dims + 4
+            and colors.shape[:-2] == batch_dims + (C, N)
+            and colors.shape[-1] == 3
+        ), colors.shape
+        assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
+        if distributed:
+            assert (
+                colors.dim() == num_batch_dims + 3
+            ), "Distributed mode only supports per-Gaussian colors."
+
+    if absgrad:
+        assert not distributed, "AbsGrad is not supported in distributed mode."
+
+    # Implement the multi-GPU strategy proposed in
+    # `On Scaling Up 3D Gaussian Splatting Training <https://arxiv.org/abs/2406.18533>`.
+    #
+    # If in distributed mode, we distribute the projection computation over Gaussians
+    # and the rasterize computation over cameras. So first we gather the cameras
+    # from all ranks for projection.
+    if distributed:
+        assert batch_dims == (), "Distributed mode does not support batch dimensions"
+        world_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        # Gather the number of Gaussians in each rank.
+        N_world = all_gather_int32(world_size, N, device=device)
+
+        # Enforce that the number of cameras is the same across all ranks.
+        C_world = [C] * world_size
+        viewmats, Ks = all_gather_tensor_list(world_size, [viewmats, Ks])
+        # if viewmats_rs is not None:
+        #     (viewmats_rs,) = all_gather_tensor_list(world_size, [viewmats_rs])
+
+        # Silently change C from local #Cameras to global #Cameras.
+        C = len(viewmats)
+
+    # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+    proj_results = fully_fused_projection(
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d=eps2d,
+        packed=packed,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        radius_clip=radius_clip,
+        sparse_grad=sparse_grad,
+        calc_compensations=(rasterize_mode == "antialiased"),
+        camera_model=camera_model,
+        opacities=opacities,  # use opacities to compute a tigher bound for radii.
+    )
+
+    if packed:
+        # The results are packed into shape [nnz, ...]. All elements are valid.
+        (
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            radii,
+            means2d,
+            depths,
+            conics,
+            compensations,
+        ) = proj_results
+        opacities = opacities.view(B, N)[batch_ids, gaussian_ids]  # [nnz]
+        image_ids = batch_ids * C + camera_ids
+    else:
+        # The results are with shape [..., C, N, ...]. Only the elements with radii > 0 are valid.
+        radii, means2d, depths, conics, compensations = proj_results
+        opacities = torch.broadcast_to(
+            opacities[..., None, :], batch_dims + (C, N)
+        )  # [..., C, N]
+        batch_ids, camera_ids, gaussian_ids = None, None, None
+        image_ids = None
+
+    if compensations is not None:
+        opacities = opacities * compensations
+
+    meta.update(
+        {
+            # global batch and camera ids
+            "batch_ids": batch_ids,
+            "camera_ids": camera_ids,
+            # local gaussian_ids
+            "gaussian_ids": gaussian_ids,
+            "radii": radii,
+            "means2d": means2d,
+            "depths": depths,
+            "conics": conics,
+            "opacities": opacities,
+        }
+    )
+
+    # * Prepare directional vectors from camera to Gaussians
+    campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
+    # Here, dirs is not normalized.
+    if packed:
+        dirs = (
+            means.view(B, N, 3)[batch_ids, gaussian_ids]
+            - campos.view(B, C, 3)[batch_ids, camera_ids]
+        )  # [nnz, 3]
+    else:
+        dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+    # * Prepare normals
+    # Here, normals are in world space.
+    if packed:
+        normals, min_scale = _decouple_normals(
+            scales.view(B, N, 3)[batch_ids, gaussian_ids],
+            quats.view(B, N, 4)[batch_ids, gaussian_ids],
+            dirs,
+        )  # [nnz, 3], [nnz,]
+    else:
+        normals, min_scale = _decouple_normals(
+            torch.broadcast_to(scales[..., None, :, :], batch_dims + (C, N, 3)),
+            torch.broadcast_to(quats[..., None, :, :], batch_dims + (C, N, 4)),
+            dirs,
+        )  # [..., C, N, 3], [..., C, N]
+    # masks = (radii > 0).all(dim=-1)  # [nnz,] or [..., C, N]
+    # min_scale = min_scale[masks]
+    # meta.update({"min_scale": min_scale})
+
+    # * Prepare distances from camera to flattened Gaussian planes
+    distances = _distance_to_Gaussian_planes(dirs, normals)
+
+    # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
+    if sh_degree is None:
+        # Colors are post-activation values, with shape [..., N, D] or [..., C, N, D]
+        if packed:
+            if colors.dim() == num_batch_dims + 2:
+                # Turn [..., N, D] into [nnz, D]
+                colors = colors.view(B, N, -1)[batch_ids, gaussian_ids]
+            else:
+                # Turn [..., C, N, D] into [nnz, D]
+                colors = colors.view(B, C, N, -1)[batch_ids, camera_ids, gaussian_ids]
+        else:
+            if colors.dim() == num_batch_dims + 2:
+                # Turn [..., N, D] into [..., C, N, D]
+                colors = torch.broadcast_to(
+                    colors[..., None, :, :], batch_dims + (C, N, -1)
+                )
+            else:
+                # colors is already [..., C, N, D]
+                pass
+    else:
+        if packed:
+            masks = (radii > 0).all(dim=-1)  # [nnz]
+            if colors.dim() == num_batch_dims + 3:
+                # Turn [..., N, K, 3] into [nnz, 3]
+                shs = colors.view(B, N, -1, 3)[batch_ids, gaussian_ids]  # [nnz, K, 3]
+            else:
+                # Turn [..., C, N, K, 3] into [nnz, 3]
+                shs = colors.view(B, C, N, -1, 3)[
+                    batch_ids, camera_ids, gaussian_ids
+                ]  # [nnz, K, 3]
+            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
+        else:
+            masks = (radii > 0).all(dim=-1)  # [..., C, N]
+            if colors.dim() == num_batch_dims + 3:
+                # Turn [..., N, K, 3] into [..., C, N, K, 3]
+                shs = torch.broadcast_to(
+                    colors[..., None, :, :, :], batch_dims + (C, N, -1, 3)
+                )
+            else:
+                # colors is already [..., C, N, K, 3]
+                shs = colors
+            colors = spherical_harmonics(
+                sh_degree, dirs, shs, masks=masks
+            )  # [..., C, N, 3]
+        # make it apple-to-apple with Inria's CUDA Backend.
+        colors = torch.clamp_min(colors + 0.5, 0.0)
+
+    # * convert nomals into camera space for computing depth
+    world2cam_Rs = viewmats[..., :3, :3]
+    if packed:
+        world2cam_Rs = world2cam_Rs.view(B, C, 3, 3)[batch_ids, camera_ids]
+    else:
+        world2cam_Rs = world2cam_Rs[..., None, :, :].expand(*batch_dims, C, N, 3, 3)
+    assert world2cam_Rs.shape == normals.shape[:-1] + (3, 3)
+    normals = torch.einsum("...ij,...j->...i", world2cam_Rs, normals)
+    # * Append normals and distances to colors for rasterization
+    colors = torch.cat([colors, normals, distances], dim=-1)
+    if backgrounds is not None:
+        backgrounds = torch.cat(
+            [
+                backgrounds,
+                torch.zeros(batch_dims + (C, 4), device=backgrounds.device),
+            ],
+            dim=-1,
+        )  # [..., C, D+4]
+
+    # If in distributed mode, we need to scatter the GSs to the destination ranks, based
+    # on which cameras they are visible to, which we already figured out in the projection
+    # stage.
+    if distributed:
+        if packed:
+            # count how many elements need to be sent to each rank
+            cnts = torch.bincount(camera_ids, minlength=C)  # all cameras
+            cnts = cnts.split(C_world, dim=0)
+            cnts = [cuts.sum() for cuts in cnts]
+
+            # all to all communication across all ranks. After this step, each rank
+            # would have all the necessary GSs to render its own images.
+            collected_splits = all_to_all_int32(world_size, cnts, device=device)
+            (radii,) = all_to_all_tensor_list(
+                world_size, [radii], cnts, output_splits=collected_splits
+            )
+            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+                world_size,
+                [means2d, depths, conics, opacities, colors],
+                cnts,
+                output_splits=collected_splits,
+            )
+
+            # before sending the data, we should turn the camera_ids from global to local.
+            # i.e. the camera_ids produced by the projection stage are over all cameras world-wide,
+            # so we need to turn them into camera_ids that are local to each rank.
+            offsets = torch.tensor(
+                [0] + C_world[:-1], device=camera_ids.device, dtype=camera_ids.dtype
+            )
+            offsets = torch.cumsum(offsets, dim=0)
+            offsets = offsets.repeat_interleave(torch.stack(cnts))
+            camera_ids = camera_ids - offsets
+
+            # and turn gaussian ids from local to global.
+            offsets = torch.tensor(
+                [0] + N_world[:-1],
+                device=gaussian_ids.device,
+                dtype=gaussian_ids.dtype,
+            )
+            offsets = torch.cumsum(offsets, dim=0)
+            offsets = offsets.repeat_interleave(torch.stack(cnts))
+            gaussian_ids = gaussian_ids + offsets
+
+            # all to all communication across all ranks.
+            (camera_ids, gaussian_ids) = all_to_all_tensor_list(
+                world_size,
+                [camera_ids, gaussian_ids],
+                cnts,
+                output_splits=collected_splits,
+            )
+
+            # Silently change C from global #Cameras to local #Cameras.
+            C = C_world[world_rank]
+
+        else:
+            # Silently change C from global #Cameras to local #Cameras.
+            C = C_world[world_rank]
+
+            # all to all communication across all ranks. After this step, each rank
+            # would have all the necessary GSs to render its own images.
+            (radii,) = all_to_all_tensor_list(
+                world_size,
+                [radii.flatten(0, 1)],
+                splits=[C_i * N for C_i in C_world],
+                output_splits=[C * N_i for N_i in N_world],
+            )
+            radii = reshape_view(C, radii, N_world)
+
+            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+                world_size,
+                [
+                    means2d.flatten(0, 1),
+                    depths.flatten(0, 1),
+                    conics.flatten(0, 1),
+                    opacities.flatten(0, 1),
+                    colors.flatten(0, 1),
+                ],
+                splits=[C_i * N for C_i in C_world],
+                output_splits=[C * N_i for N_i in N_world],
+            )
+            means2d = reshape_view(C, means2d, N_world)
+            depths = reshape_view(C, depths, N_world)
+            conics = reshape_view(C, conics, N_world)
+            opacities = reshape_view(C, opacities, N_world)
+            colors = reshape_view(C, colors, N_world)
+
+    # Identify intersecting tiles
+    tile_width = math.ceil(width / float(tile_size))
+    tile_height = math.ceil(height / float(tile_size))
+    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        segmented=segmented,
+        packed=packed,
+        n_images=I,
+        image_ids=image_ids,
+        gaussian_ids=gaussian_ids,
+    )
+    # print("rank", world_rank, "Before isect_offset_encode")
+    isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
+    isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))
+
+    meta.update(
+        {
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+            "tiles_per_gauss": tiles_per_gauss,
+            "isect_ids": isect_ids,
+            "flatten_ids": flatten_ids,
+            "isect_offsets": isect_offsets,
+            "width": width,
+            "height": height,
+            "tile_size": tile_size,
+            "n_batches": B,
+            "n_cameras": C,
+        }
+    )
+
+    # print("rank", world_rank, "Before rasterize_to_pixels")
+    if colors.shape[-1] > channel_chunk:
+        # slice into chunks
+        n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
+        render_colors, render_alphas = [], []
+        for i in range(n_chunks):
+            colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
+            backgrounds_chunk = (
+                backgrounds[..., i * channel_chunk : (i + 1) * channel_chunk]
+                if backgrounds is not None
+                else None
+            )
+            render_colors_, render_alphas_ = rasterize_to_pixels(
+                means2d,
+                conics,
+                colors_chunk,
+                opacities,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+                backgrounds=backgrounds_chunk,
+                packed=packed,
+                absgrad=absgrad,
+            )
+            render_colors.append(render_colors_)
+            render_alphas.append(render_alphas_)
+        render_colors = torch.cat(render_colors, dim=-1)
+        render_alphas = render_alphas[0]  # discard the rest
+    else:
+        render_colors, render_alphas = rasterize_to_pixels(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds,
+            packed=packed,
+            absgrad=absgrad,
+        )
+
+    render_distances = render_colors[..., -1:]  # [..., C, H, W, 1]
+    render_normals = render_colors[..., -4:-1]  # [..., C, H, W, 3]
+    render_colors = render_colors[..., :-4]  # [..., C, H, W, D]
+
+    render_masks = (render_alphas > 0.1).detach().float()  # [..., C, H, W, 1]
+    # normalize render_normals and set invalid normals to zero
+    render_normals = F.normalize(render_normals, dim=-1)
+    render_normals = render_normals * render_masks
+
+    # * Compute unbiased depth
+    render_depths = _depth_from_planes(render_distances, render_normals, Ks)
+    render_depths = render_depths * render_masks
+
+    # * Compute surface normals from depth
+    eye_poses = torch.eye(4, dtype=viewmats.dtype, device=viewmats.device)
+    eye_poses = eye_poses.view([1] * len(batch_dims) + [3, 3]).expand_as(viewmats)
+    render_normals_from_depth = depth_to_normal(render_depths, eye_poses, Ks)
+    render_normals_from_depth = render_normals_from_depth * render_masks
+
+    return (
+        render_colors,
+        render_depths,
+        render_normals,
+        render_normals_from_depth,
+        render_alphas,
+        meta,
+    )
 
 
 def rasterization(
