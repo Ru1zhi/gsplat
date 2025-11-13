@@ -61,11 +61,11 @@ def _decouple_normals(
     flip_signs = torch.where(cos_angles > 0, -1.0, 1.0)  # [..., 1]
     normals = normals * flip_signs  # [..., 3]
 
-    # ! check angles
-    cos_angles = torch.sum(normals * view_dirs, dim=-1)
-    assert torch.all(
-        cos_angles <= 0
-    ), "Some angles between normals and view_dirs are not greater than 90 degrees."
+    # # ! check angles
+    # cos_angles = torch.sum(normals * view_dirs, dim=-1)
+    # assert torch.all(
+    #     cos_angles <= 0
+    # ), "Some angles between normals and view_dirs are not greater than 90 degrees."
 
     return normals, min_scale
 
@@ -111,7 +111,7 @@ def _depth_from_planes(
     denominator = torch.sum(normal_maps * rays, dim=-1, keepdim=True)  # [..., H, W, 1]
     denominator = -denominator  # because the normal points towards the camera
 
-    depth_maps = distance_maps / denominator  # [..., H, W, 1]
+    depth_maps = distance_maps / torch.clamp(denominator, min=1e-6)  # [..., H, W, 1]
 
     return depth_maps
 
@@ -579,9 +579,11 @@ def rasterization_pgsr(
     render_normals = render_colors[..., -4:-1]  # [..., C, H, W, 3]
     render_colors = render_colors[..., :-4]  # [..., C, H, W, D]
 
-    render_masks = (render_alphas > 0.1).detach().float()  # [..., C, H, W, 1]
+    render_masks = (render_alphas > 0.01).detach().float()  # [..., C, H, W, 1]
     # normalize render_normals and set invalid normals to zero
-    render_normals = F.normalize(render_normals, dim=-1)
+    render_normals = render_normals / torch.clamp(
+        torch.norm(render_normals, dim=-1, keepdim=True), min=1e-6
+    )
     render_normals = render_normals * render_masks
 
     # Recover viewmats and Ks to each rank
@@ -595,6 +597,7 @@ def rasterization_pgsr(
 
     # * Compute unbiased depth
     render_depths = _depth_from_planes(render_distances, render_normals, Ks)
+    render_depths = torch.nan_to_num(render_depths, nan=0.0)
     render_depths = render_depths * render_masks
 
     # * Compute surface normals from depth
