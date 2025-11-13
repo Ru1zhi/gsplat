@@ -579,12 +579,12 @@ def rasterization_pgsr(
     render_normals = render_colors[..., -4:-1]  # [..., C, H, W, 3]
     render_colors = render_colors[..., :-4]  # [..., C, H, W, D]
 
-    render_masks = (render_alphas > 0.01).detach().float()  # [..., C, H, W, 1]
+    alpha_masks = (render_alphas > 0.01).detach().float()  # [..., C, H, W, 1]
     # normalize render_normals and set invalid normals to zero
     render_normals = render_normals / torch.clamp(
         torch.norm(render_normals, dim=-1, keepdim=True), min=1e-6
     )
-    render_normals = render_normals * render_masks
+    render_normals = render_normals * alpha_masks
 
     # Recover viewmats and Ks to each rank
     if distributed:
@@ -598,13 +598,14 @@ def rasterization_pgsr(
     # * Compute unbiased depth
     render_depths = _depth_from_planes(render_distances, render_normals, Ks)
     render_depths = torch.nan_to_num(render_depths, nan=0.0)
-    render_depths = render_depths * render_masks
+    render_depths = render_depths * alpha_masks
+    depth_masks = (render_depths > 0).detach().float()
 
     # * Compute surface normals from depth
     eye_poses = torch.eye(4, dtype=viewmats.dtype, device=viewmats.device)
     eye_poses = eye_poses.view([1] * len(batch_dims) + [4, 4]).expand_as(viewmats)
     render_normals_from_depth = depth_to_normal(render_depths, eye_poses, Ks)
-    render_normals_from_depth = render_normals_from_depth * render_masks
+    render_normals_from_depth = render_normals_from_depth * depth_masks
 
     return (
         render_colors,
