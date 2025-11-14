@@ -27,7 +27,46 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .utils import depth_to_normal, get_projection_matrix
+from .utils import depth_to_normal, get_projection_matrix, normalized_quat_to_rotmat
+
+
+def _decouple_normals(
+    scales: Tensor,  # [..., 3]
+    quats: Tensor,  # [..., 4]
+    view_dirs: Tensor,  # [..., 3]
+    is_flatten: bool = False,
+) -> Tuple[
+    Tensor,  # normals: Tensor [..., 3]
+    Tensor,  # min_scale: Tensor [...,]
+]:
+    batch_dims = scales.shape[:-1]
+    assert scales.shape == batch_dims + (3,), scales.shape
+    assert quats.shape == batch_dims + (4,), quats.shape
+    assert view_dirs.shape == batch_dims + (3,), view_dirs.shape
+
+    # * Get rotation matrices from quaternions
+    rotmats = normalized_quat_to_rotmat(F.normalize(quats, dim=-1))  # [..., 3, 3]
+
+    # * Select the axis with minimal scale as normal
+    if is_flatten:
+        min_scale = scales[..., -1]  # [...,]
+        normals = rotmats[..., :, -1]  # [..., 3]
+    else:
+        min_scale, min_indices = torch.min(scales, dim=-1)  # [...,], [...,]
+        mesh = torch.meshgrid(
+            *[torch.arange(s, device=scales.device) for s in batch_dims], indexing="ij"
+        )
+        sel_idxs = tuple(mesh) + (min_indices,)
+        # selecte columns from rotmats
+        normals = rotmats.transpose(-1, -2)[sel_idxs]  # [..., 3]
+
+    # * Ensure the angles between normals and view_dirs are greater than 90 degrees
+    view_dirs = F.normalize(view_dirs, dim=-1)  # [..., 3]
+    cos_angles = torch.sum(normals * view_dirs, dim=-1, keepdim=True)  # [..., 1]
+    flip_signs = torch.where(cos_angles > 0, -1.0, 1.0)  # [..., 1]
+    normals = normals * flip_signs  # [..., 3]
+
+    return normals, min_scale
 
 
 def rasterization(
@@ -67,6 +106,9 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    # render geometry
+    return_normals: bool = False,
+    is_flatten: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -467,6 +509,36 @@ def rasterization(
         }
     )
 
+    # * Prepare directional vectors from camera to Gaussians
+    campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
+    # Here, dirs is not normalized.
+    if packed:
+        dirs = (
+            means.view(B, N, 3)[batch_ids, gaussian_ids]
+            - campos.view(B, C, 3)[batch_ids, camera_ids]
+        )  # [nnz, 3]
+    else:
+        dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+    # * Prepare normals
+    if return_normals:
+        # Here, normals are in world space.
+        if packed:
+            normals, min_scale = _decouple_normals(
+                scales.view(B, N, 3)[batch_ids, gaussian_ids],
+                quats.view(B, N, 4)[batch_ids, gaussian_ids],
+                dirs,
+                is_flatten=is_flatten,
+            )  # [nnz, 3], [nnz,]
+        else:
+            normals, min_scale = _decouple_normals(
+                torch.broadcast_to(scales[..., None, :, :], batch_dims + (C, N, 3)),
+                torch.broadcast_to(quats[..., None, :, :], batch_dims + (C, N, 4)),
+                dirs,
+                is_flatten=is_flatten,
+            )  # [..., C, N, 3], [..., C, N]
+    else:
+        normals, min_scale = None, None
+
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
         # Colors are post-activation values, with shape [..., N, D] or [..., C, N, D]
@@ -488,15 +560,15 @@ def rasterization(
                 pass
     else:
         # Colors are SH coefficients, with shape [..., N, K, 3] or [..., C, N, K, 3]
-        campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
+        # campos = torch.inverse(viewmats)[..., :3, 3]  # [..., C, 3]
         if viewmats_rs is not None:
             campos_rs = torch.inverse(viewmats_rs)[..., :3, 3]
             campos = 0.5 * (campos + campos_rs)  # [..., C, 3]
         if packed:
-            dirs = (
-                means.view(B, N, 3)[batch_ids, gaussian_ids]
-                - campos.view(B, C, 3)[batch_ids, camera_ids]
-            )  # [nnz, 3]
+            # dirs = (
+            #     means.view(B, N, 3)[batch_ids, gaussian_ids]
+            #     - campos.view(B, C, 3)[batch_ids, camera_ids]
+            # )  # [nnz, 3]
             masks = (radii > 0).all(dim=-1)  # [nnz]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [nnz, 3]
@@ -508,7 +580,7 @@ def rasterization(
                 ]  # [nnz, K, 3]
             colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
         else:
-            dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+            # dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
             masks = (radii > 0).all(dim=-1)  # [..., C, N]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [..., C, N, K, 3]
@@ -523,6 +595,18 @@ def rasterization(
             )  # [..., C, N, 3]
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
+
+    if return_normals:
+        # * Append normals to colors
+        colors = torch.cat((colors, normals), dim=-1)
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(batch_dims + (C, 3), device=backgrounds.device),
+                ],
+                dim=-1,
+            )  # [..., C, D+3]
 
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
@@ -622,9 +706,18 @@ def rasterization(
                 dim=-1,
             )
     elif render_mode in ["D", "ED"]:
-        colors = depths[..., None]
-        if backgrounds is not None:
-            backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
+        if return_normals:
+            colors = torch.cat((colors[..., -3:], depths[..., None]), dim=-1)
+            if backgrounds is not None:
+                backgrounds = torch.zeros(
+                    batch_dims + (C, 4), device=backgrounds.device
+                )
+        else:
+            colors = depths[..., None]
+            if backgrounds is not None:
+                backgrounds = torch.zeros(
+                    batch_dims + (C, 1), device=backgrounds.device
+                )
     else:  # RGB
         pass
 
@@ -757,15 +850,51 @@ def rasterization(
                 packed=packed,
                 absgrad=absgrad,
             )
-    if render_mode in ["ED", "RGB+ED"]:
-        # normalize the accumulated depth to get the expected depth
-        render_colors = torch.cat(
-            [
-                render_colors[..., :-1],
-                render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
-            ],
-            dim=-1,
-        )
+
+    # Separate depth map
+    if render_mode in ["D", "ED", "RGB+D", "RGB+ED"]:
+        render_depths = render_colors[..., -1:]  # [..., 1]
+        render_colors = render_colors[..., :-1]  # [..., D] or [..., D+3]
+
+        if render_mode in ["ED", "RGB+ED"]:
+            # normalize the accumulated depth to get the expected depth
+            render_depths = render_depths / render_alphas.clamp(min=1e-10)
+    else:
+        render_depths = None
+
+    # Separate normal map
+    if return_normals:
+        render_normals = render_colors[..., -3:]  # [..., 3]
+        render_colors = render_colors[..., :-3]  # [..., D]
+
+        normals_magnitude = torch.norm(render_normals, dim=-1, keepdim=True)
+        valid_mask = (normals_magnitude > 1e-10).float()
+        render_normals = render_normals / normals_magnitude.clamp(min=1e-10)
+        render_normals = render_normals * valid_mask
+    else:
+        render_normals = None
+
+    # if render_mode in ["ED", "RGB+ED"]:
+    #     # normalize the accumulated depth to get the expected depth
+    #     render_colors = torch.cat(
+    #         [
+    #             render_colors[..., :-1],
+    #             render_colors[..., -1:] / render_alphas.clamp(min=1e-10),
+    #         ],
+    #         dim=-1,
+    #     )
+
+    renderings = []
+    if "RGB" in render_mode:
+        assert render_colors.shape[-1] > 0
+        renderings.append(render_colors)
+    if "D" in render_mode or "ED" in render_mode:
+        assert render_depths is not None
+        renderings.append(render_depths)
+    if return_normals:
+        assert render_normals is not None
+        renderings.append(render_normals)
+    render_colors = torch.cat(renderings, dim=-1)
 
     return render_colors, render_alphas, meta
 
