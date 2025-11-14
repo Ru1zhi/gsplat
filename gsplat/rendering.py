@@ -34,6 +34,7 @@ def _decouple_normals(
     scales: Tensor,  # [..., 3]
     quats: Tensor,  # [..., 4]
     view_dirs: Tensor,  # [..., 3]
+    is_flatten: bool = False,
 ) -> Tuple[
     Tensor,  # normals: Tensor [..., 3]
     Tensor,  # min_scale: Tensor [...,]
@@ -47,13 +48,17 @@ def _decouple_normals(
     rotmats = normalized_quat_to_rotmat(F.normalize(quats, dim=-1))  # [..., 3, 3]
 
     # * Select the axis with minimal scale as normal
-    min_scale, min_indices = torch.min(scales, dim=-1)  # [...,], [...,]
-    mesh = torch.meshgrid(
-        *[torch.arange(s, device=scales.device) for s in batch_dims], indexing="ij"
-    )
-    sel_idxs = tuple(mesh) + (min_indices,)
-    # selecte columns from rotmats
-    normals = rotmats.transpose(-1, -2)[sel_idxs]  # [..., 3]
+    if is_flatten:
+        min_scale = scales[..., -1]  # [...,]
+        normals = rotmats[..., :, -1]  # [..., 3]
+    else:
+        min_scale, min_indices = torch.min(scales, dim=-1)  # [...,], [...,]
+        mesh = torch.meshgrid(
+            *[torch.arange(s, device=scales.device) for s in batch_dims], indexing="ij"
+        )
+        sel_idxs = tuple(mesh) + (min_indices,)
+        # selecte columns from rotmats
+        normals = rotmats.transpose(-1, -2)[sel_idxs]  # [..., 3]
 
     # * Ensure the angles between normals and view_dirs are greater than 90 degrees
     view_dirs = F.normalize(view_dirs, dim=-1)  # [..., 3]
@@ -143,6 +148,7 @@ def rasterization_pgsr(
     camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
     segmented: bool = False,
     covars: Optional[Tensor] = None,
+    is_flatten: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C) according to `PGSR`.
 
@@ -327,12 +333,14 @@ def rasterization_pgsr(
             scales.view(B, N, 3)[batch_ids, gaussian_ids],
             quats.view(B, N, 4)[batch_ids, gaussian_ids],
             dirs,
+            is_flatten=is_flatten,
         )  # [nnz, 3], [nnz,]
     else:
         normals, min_scale = _decouple_normals(
             torch.broadcast_to(scales[..., None, :, :], batch_dims + (C, N, 3)),
             torch.broadcast_to(quats[..., None, :, :], batch_dims + (C, N, 4)),
             dirs,
+            is_flatten=is_flatten,
         )  # [..., C, N, 3], [..., C, N]
     # masks = (radii > 0).all(dim=-1)  # [nnz,] or [..., C, N]
     # min_scale = min_scale[masks]
