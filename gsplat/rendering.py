@@ -536,6 +536,12 @@ def rasterization(
                 dirs,
                 is_flatten=is_flatten,
             )  # [..., C, N, 3], [..., C, N]
+
+        meta.update(
+            {
+                "min_scale": min_scale,
+            }
+        )
     else:
         normals, min_scale = None, None
 
@@ -596,18 +602,6 @@ def rasterization(
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
 
-    if return_normals:
-        # * Append normals to colors
-        colors = torch.cat((colors, normals), dim=-1)
-        if backgrounds is not None:
-            backgrounds = torch.cat(
-                [
-                    backgrounds,
-                    torch.zeros(batch_dims + (C, 3), device=backgrounds.device),
-                ],
-                dim=-1,
-            )  # [..., C, D+3]
-
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
     # stage.
@@ -624,12 +618,29 @@ def rasterization(
             (radii,) = all_to_all_tensor_list(
                 world_size, [radii], cnts, output_splits=collected_splits
             )
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
-                world_size,
-                [means2d, depths, conics, opacities, colors],
-                cnts,
-                output_splits=collected_splits,
-            )
+            if not return_normals:
+                (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+                    world_size,
+                    [means2d, depths, conics, opacities, colors],
+                    cnts,
+                    output_splits=collected_splits,
+                )
+            else:
+                assert normals is not None
+                (
+                    means2d,
+                    depths,
+                    conics,
+                    opacities,
+                    colors,
+                    normals,
+                    min_scale,
+                ) = all_to_all_tensor_list(
+                    world_size,
+                    [means2d, depths, conics, opacities, colors, normals, min_scale],
+                    cnts,
+                    output_splits=collected_splits,
+                )
 
             # before sending the data, we should turn the camera_ids from global to local.
             # i.e. the camera_ids produced by the projection stage are over all cameras world-wide,
@@ -676,23 +687,68 @@ def rasterization(
             )
             radii = reshape_view(C, radii, N_world)
 
-            (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
-                world_size,
+            if not return_normals:
+                (means2d, depths, conics, opacities, colors) = all_to_all_tensor_list(
+                    world_size,
+                    [
+                        means2d.flatten(0, 1),
+                        depths.flatten(0, 1),
+                        conics.flatten(0, 1),
+                        opacities.flatten(0, 1),
+                        colors.flatten(0, 1),
+                    ],
+                    splits=[C_i * N for C_i in C_world],
+                    output_splits=[C * N_i for N_i in N_world],
+                )
+                means2d = reshape_view(C, means2d, N_world)
+                depths = reshape_view(C, depths, N_world)
+                conics = reshape_view(C, conics, N_world)
+                opacities = reshape_view(C, opacities, N_world)
+                colors = reshape_view(C, colors, N_world)
+            else:
+                assert normals is not None
+                (
+                    means2d,
+                    depths,
+                    conics,
+                    opacities,
+                    colors,
+                    normals,
+                    min_scale,
+                ) = all_to_all_tensor_list(
+                    world_size,
+                    [
+                        means2d.flatten(0, 1),
+                        depths.flatten(0, 1),
+                        conics.flatten(0, 1),
+                        opacities.flatten(0, 1),
+                        colors.flatten(0, 1),
+                        normals.flatten(0, 1),
+                        min_scale.flatten(0, 1),
+                    ],
+                    splits=[C_i * N for C_i in C_world],
+                    output_splits=[C * N_i for N_i in N_world],
+                )
+                means2d = reshape_view(C, means2d, N_world)
+                depths = reshape_view(C, depths, N_world)
+                conics = reshape_view(C, conics, N_world)
+                opacities = reshape_view(C, opacities, N_world)
+                colors = reshape_view(C, colors, N_world)
+                normals = reshape_view(C, normals, N_world)
+                min_scale = reshape_view(C, min_scale, N_world)
+
+    if return_normals:
+        assert min_scale.shape == opacities.shape, min_scale.shape
+
+        colors = torch.cat((colors, normals), dim=-1)
+        if backgrounds is not None:
+            backgrounds = torch.cat(
                 [
-                    means2d.flatten(0, 1),
-                    depths.flatten(0, 1),
-                    conics.flatten(0, 1),
-                    opacities.flatten(0, 1),
-                    colors.flatten(0, 1),
+                    backgrounds,
+                    torch.zeros(batch_dims + (C, 3), device=backgrounds.device),
                 ],
-                splits=[C_i * N for C_i in C_world],
-                output_splits=[C * N_i for N_i in N_world],
+                dim=-1,
             )
-            means2d = reshape_view(C, means2d, N_world)
-            depths = reshape_view(C, depths, N_world)
-            conics = reshape_view(C, conics, N_world)
-            opacities = reshape_view(C, opacities, N_world)
-            colors = reshape_view(C, colors, N_world)
 
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
