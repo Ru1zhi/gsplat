@@ -539,6 +539,7 @@ def isect_offset_encode(
         isect_ids.contiguous(), n_images, tile_width, tile_height
     )
 
+
 @overload
 def rasterize_to_pixels(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
@@ -557,6 +558,7 @@ def rasterize_to_pixels(
     metric_maps: None = None,
 ) -> Tuple[Tensor, Tensor]: ...
 
+
 @overload
 def rasterize_to_pixels(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
@@ -572,8 +574,9 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
-    metric_maps: Tensor,  # [..., height, width]
+    metric_maps: Tensor = ...,  # [..., height, width]
 ) -> Tuple[Tensor, Tensor, Tensor]: ...
+
 
 def rasterize_to_pixels(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
