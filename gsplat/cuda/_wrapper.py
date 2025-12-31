@@ -621,7 +621,7 @@ def rasterize_to_pixels(
         - **Metric counts**. [..., N] (Optional, only returned if `metric_maps` is provided)
     """
     if metric_maps is not None:
-        assert packed == False, "metric_maps is not supported in packed mode"
+        assert not packed, "metric_maps is not supported in packed mode"
 
     image_dims = means2d.shape[:-2]
     channels = colors.shape[-1]
@@ -1424,6 +1424,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
+            None,
             None,
             None,
             None,
