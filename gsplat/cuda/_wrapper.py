@@ -572,13 +572,17 @@ def rasterize_to_pixels(
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        metric_maps: If provided, will count the number of Gaussians contributing to each pixel. [..., height, width]. Default: None.
 
     Returns:
         A tuple:
 
         - **Rendered colors**. [..., image_height, image_width, channels]
         - **Rendered alphas**. [..., image_height, image_width, 1]
+        - **Metric counts**. [..., N] (Optional, only returned if `metric_maps` is provided)
     """
+    if metric_maps is not None:
+        assert packed == False, "metric_maps is not supported in packed mode"
 
     image_dims = means2d.shape[:-2]
     channels = colors.shape[-1]
