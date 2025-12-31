@@ -574,7 +574,8 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
-    metric_maps: Tensor = ...,  # [..., height, width]
+    *,
+    metric_maps: Tensor,  # [..., height, width]
 ) -> Tuple[Tensor, Tensor, Tensor]: ...
 
 
