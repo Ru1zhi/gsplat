@@ -33,10 +33,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t tile_height,
     const int32_t *__restrict__ tile_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
+    const bool *__restrict__ metric_maps,     // [I, H, W]
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [I, image_height, image_width]
+    int32_t *__restrict__ last_ids,       // [I, image_height, image_width]
+    int32_t * __restrict__ metric_counts  // [I, N]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -57,6 +59,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     }
     if (masks != nullptr) {
         masks += image_id * tile_height * tile_width;
+    }
+    if (!packed && metric_maps != nullptr && metric_counts != nullptr) {
+        metric_maps += image_id * image_height * image_width;
     }
 
     float px = (float)j + 0.5f;
@@ -165,6 +170,13 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             }
             cur_idx = batch_start + t;
 
+            // accumulate metric count if needed
+            if (!packed && metric_maps != nullptr && metric_counts != nullptr) {
+                if (metric_maps[pix_id]) {
+                    atomicAdd(&metric_counts[g], 1);
+                }
+            }
+
             T = next_T;
         }
     }
@@ -203,10 +215,12 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
+    const at::optional<at::Tensor> metric_maps, // [..., H, W]
     // outputs
-    at::Tensor renders, // [..., image_height, image_width, channels]
-    at::Tensor alphas,  // [..., image_height, image_width]
-    at::Tensor last_ids // [..., image_height, image_width]
+    at::Tensor renders,     // [..., image_height, image_width, channels]
+    at::Tensor alphas,      // [..., image_height, image_width]
+    at::Tensor last_ids,    // [..., image_height, image_width]
+    at::optional<at::Tensor> metric_counts  // [..., N]
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -259,9 +273,11 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             tile_height,
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
+            metric_maps.has_value() ? metric_maps.value().data_ptr<bool>() : nullptr,
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            metric_counts.has_value() ? metric_counts.value().data_ptr<int32_t>() : nullptr
         );
 }
 
@@ -281,9 +297,11 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         uint32_t tile_size,                                                    \
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
+        const at::optional<at::Tensor> metric_maps,                            \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
-        at::Tensor last_ids                                                    \
+        at::Tensor last_ids,                                                   \
+        at::optional<at::Tensor> metric_counts                                 \
     );
 
 __INS__(1)
