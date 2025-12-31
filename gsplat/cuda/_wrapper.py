@@ -722,7 +722,7 @@ def rasterize_to_pixels(
         # keep old output signature
         return render_colors, render_alphas
     else:
-        assert metric_counts is not None
+        # assert metric_counts is not None
         return render_colors, render_alphas, metric_counts
 
 
@@ -1364,6 +1364,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx,
         v_render_colors: Tensor,  # [..., H, W, 3]
         v_render_alphas: Tensor,  # [..., H, W, 1]
+        _,  # metric_counts, it is None or int32 tensor, no grad
     ):
         (
             means2d,
