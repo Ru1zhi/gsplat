@@ -2,7 +2,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union, overload
 
 import torch
 from torch import Tensor
@@ -539,6 +539,41 @@ def isect_offset_encode(
         isect_ids.contiguous(), n_images, tile_width, tile_height
     )
 
+@overload
+def rasterize_to_pixels(
+    means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+    conics: Tensor,  # [..., N, 3] or [nnz, 3]
+    colors: Tensor,  # [..., N, channels] or [nnz, channels]
+    opacities: Tensor,  # [..., N] or [nnz]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+    packed: bool = False,
+    absgrad: bool = False,
+    metric_maps: None = None,
+) -> Tuple[Tensor, Tensor]: ...
+
+@overload
+def rasterize_to_pixels(
+    means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+    conics: Tensor,  # [..., N, 3] or [nnz, 3]
+    colors: Tensor,  # [..., N, channels] or [nnz, channels]
+    opacities: Tensor,  # [..., N] or [nnz]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+    packed: bool = False,
+    absgrad: bool = False,
+    metric_maps: Tensor,  # [..., height, width]
+) -> Tuple[Tensor, Tensor, Tensor]: ...
 
 def rasterize_to_pixels(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
