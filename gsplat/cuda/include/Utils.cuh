@@ -771,4 +771,31 @@ inline __device__ vec3 safe_normalize_bw(const vec3 &v, const vec3 &d_out) {
     return d_out;
 }
 
+inline __device__ void computCompactBox(
+    // inputs
+    const vec2 mean2d,
+    const mat2 corvar2d,
+    const float opacity,
+    const float beta,
+    const float threshold,
+    // outputs
+    float &radius_x,
+    float &radius_y
+) {
+    // compute the compact bounding box of a 2D Gaussian
+    // (p - mu)^T * Sigma^{-1} * (p - mu) = beta * 2.0 * log(opacity / threshold)
+
+    if (opacity < threshold) {
+        radius_x = 0.f;
+        radius_y = 0.f;
+        return;
+    }
+
+    float log_term = __logf(opacity / threshold);
+    float max_mahalanobis_sq = beta * 2.0f * log_term;
+
+    radius_x = sqrtf(max_mahalanobis_sq * corvar2d[0][0]);
+    radius_y = sqrtf(max_mahalanobis_sq * corvar2d[1][1]);
+}
+
 } // namespace gsplat

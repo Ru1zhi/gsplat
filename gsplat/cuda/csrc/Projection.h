@@ -51,6 +51,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const CameraModelType camera_model,
     // outputs
     at::Tensor radii,                      // [..., C, N, 2]
@@ -105,6 +106,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const at::optional<at::Tensor>
         block_accum, // [B * C * blocks_per_row] packing helper
     const CameraModelType camera_model,

@@ -31,6 +31,7 @@ __global__ void projection_ewa_3dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const int32_t
         *__restrict__ block_accum, // [B * C * blocks_per_row] packing helper
     const CameraModelType camera_model,
@@ -178,25 +179,33 @@ __global__ void projection_ewa_3dgs_packed_fwd_kernel(
     // check if the points are in the image region
     float radius_x, radius_y;
     if (valid) {
-        float extend = 3.33f;
-        if (opacities != nullptr) {
+        if (compact_box_beta > 0.0f && opacities != nullptr) {
             float opacity = opacities[bid * N + gid];
-            if (compensations != nullptr) {
-                // we assume compensation term will be applied later on.
-                opacity *= compensation;
-            }    
-            if (opacity < ALPHA_THRESHOLD) {
-                valid = false;
-            }
-            // Compute opacity-aware bounding box.
-            // https://arxiv.org/pdf/2402.00525 Section B.2
-            extend = min(extend, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
+            computCompactBox(mean2d, covar2d, opacity, compact_box_beta, ALPHA_THRESHOLD, radius_x, radius_y);
+            radius_x = ceilf(radius_x);
+            radius_y = ceilf(radius_y);
         }
-        
-        // compute tight rectangular bounding box (non differentiable)
-        // https://arxiv.org/pdf/2402.00525
-        radius_x = ceilf(extend * sqrtf(covar2d[0][0]));
-        radius_y = ceilf(extend * sqrtf(covar2d[1][1]));
+        else {
+            float extend = 3.33f;
+            if (opacities != nullptr) {
+                float opacity = opacities[bid * N + gid];
+                if (compensations != nullptr) {
+                    // we assume compensation term will be applied later on.
+                    opacity *= compensation;
+                }    
+                if (opacity < ALPHA_THRESHOLD) {
+                    valid = false;
+                }
+                // Compute opacity-aware bounding box.
+                // https://arxiv.org/pdf/2402.00525 Section B.2
+                extend = min(extend, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
+            }
+            
+            // compute tight rectangular bounding box (non differentiable)
+            // https://arxiv.org/pdf/2402.00525
+            radius_x = ceilf(extend * sqrtf(covar2d[0][0]));
+            radius_y = ceilf(extend * sqrtf(covar2d[1][1]));
+        }
         
         if (radius_x <= radius_clip && radius_y <= radius_clip) {
             valid = false;
@@ -278,6 +287,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const at::optional<at::Tensor>
         block_accum, // [B * C * blocks_per_row] packing helper
     const CameraModelType camera_model,
@@ -340,6 +350,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
                     near_plane,
                     far_plane,
                     radius_clip,
+                    compact_box_beta,
                     block_accum.has_value()
                         ? block_accum.value().data_ptr<int32_t>()
                         : nullptr,
