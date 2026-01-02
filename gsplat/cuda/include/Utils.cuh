@@ -771,10 +771,10 @@ inline __device__ vec3 safe_normalize_bw(const vec3 &v, const vec3 &d_out) {
     return d_out;
 }
 
-inline __device__ void computCompactBox(
+inline __device__ void computCompactBoxRange(
     // inputs
     const vec2 mean2d,
-    const mat2 corvar2d,
+    const vec3 conic,
     const float opacity,
     const float beta,
     const float threshold,
@@ -782,7 +782,9 @@ inline __device__ void computCompactBox(
     float &radius_x,
     float &radius_y
 ) {
-    // compute the compact bounding box of a 2D Gaussian
+    // compute the compact bounding box range on 2D image plane
+
+    // Mahalanobis distance squared threshold for given opacity
     // (p - mu)^T * Sigma^{-1} * (p - mu) = beta * 2.0 * log(opacity / threshold)
 
     if (opacity < threshold) {
@@ -790,12 +792,14 @@ inline __device__ void computCompactBox(
         radius_y = 0.f;
         return;
     }
-
     float log_term = __logf(opacity / threshold);
     float max_mahalanobis_sq = beta * 2.0f * log_term;
 
-    radius_x = sqrtf(max_mahalanobis_sq * corvar2d[0][0]);
-    radius_y = sqrtf(max_mahalanobis_sq * corvar2d[1][1]);
+    float det = conic[0] * conic[2] - conic[1] * conic[1];
+    radius_x =
+        sqrtf(max(0.f, max_mahalanobis_sq * conic[2] / det));
+    radius_y =
+        sqrtf(max(0.f, max_mahalanobis_sq * conic[0] / det));
 }
 
 } // namespace gsplat

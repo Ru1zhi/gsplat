@@ -181,7 +181,8 @@ __global__ void projection_ewa_3dgs_packed_fwd_kernel(
     if (valid) {
         if (compact_box_beta > 0.0f && opacities != nullptr) {
             float opacity = opacities[bid * N + gid];
-            computCompactBox(mean2d, covar2d, opacity, compact_box_beta, ALPHA_THRESHOLD, radius_x, radius_y);
+            vec3 conic = vec3(covar2d_inv[0][0], covar2d_inv[0][1], covar2d_inv[1][1]);
+            computCompactBoxRange(mean2d, conic, opacity, compact_box_beta, ALPHA_THRESHOLD, radius_x, radius_y);
             radius_x = ceilf(radius_x);
             radius_y = ceilf(radius_y);
         }
