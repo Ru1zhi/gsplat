@@ -59,6 +59,7 @@ projection_ewa_3dgs_fused_fwd(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const bool calc_compensations,
     const CameraModelType camera_model
 );
@@ -119,6 +120,7 @@ projection_ewa_3dgs_packed_fwd(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const float compact_box_beta,
     const bool calc_compensations,
     const CameraModelType camera_model
 );
