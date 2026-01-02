@@ -456,6 +456,9 @@ def isect_tiles(
     n_images: Optional[int] = None,
     image_ids: Optional[Tensor] = None,
     gaussian_ids: Optional[Tensor] = None,
+    opacities: Optional[Tensor] = None,
+    conics: Optional[Tensor] = None,
+    compact_box_beta: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Maps projected Gaussians to intersecting tiles.
 
@@ -510,6 +513,9 @@ def isect_tiles(
         depths.contiguous(),
         image_ids,
         gaussian_ids,
+        opacities.contiguous() if opacities is not None else None,
+        conics.contiguous() if conics is not None else None,
+        compact_box_beta,
         I,
         tile_size,
         tile_width,

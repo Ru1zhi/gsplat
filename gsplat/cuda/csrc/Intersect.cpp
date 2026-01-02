@@ -18,6 +18,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
     const at::Tensor depths,                     // [..., N] or [nnz]
     const at::optional<at::Tensor> image_ids,    // [nnz]
     const at::optional<at::Tensor> gaussian_ids, // [nnz]
+    const at::optional<at::Tensor> opacities,    // [..., N] or [nnz]
+    const at::optional<at::Tensor> conics,       // [..., N, 3] or [nnz, 3]
+    const float compact_box_beta,
     const uint32_t I,
     const uint32_t tile_size,
     const uint32_t tile_width,
@@ -66,6 +69,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
             depths,
             packed ? image_ids : c10::nullopt,
             packed ? gaussian_ids : c10::nullopt,
+            opacities,
+            conics,
+            compact_box_beta,
             I,
             tile_size,
             tile_width,
@@ -103,6 +109,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
             depths,
             packed ? image_ids : c10::nullopt,
             packed ? gaussian_ids : c10::nullopt,
+            opacities,
+            conics,
+            compact_box_beta,
             I,
             tile_size,
             tile_width,

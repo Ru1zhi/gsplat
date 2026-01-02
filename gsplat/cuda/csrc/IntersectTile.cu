@@ -35,12 +35,15 @@ __global__ void intersect_tile_kernel(
     const scalar_t *__restrict__ means2d,            // [..., N, 2] or [nnz, 2]
     const int32_t *__restrict__ radii,               // [..., N, 2] or [nnz, 2]
     const scalar_t *__restrict__ depths,             // [..., N] or [nnz]
+    const scalar_t *__restrict__ opacities,          // [..., N] or [nnz] optional
+    const scalar_t *__restrict__ conics,             // [..., N, 3] or [nnz, 3] optional
     const int64_t *__restrict__ cum_tiles_per_gauss, // [..., N] or [nnz]
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
     const uint32_t tile_n_bits,
     const uint32_t image_n_bits,
+    const float compact_box_beta,
     int32_t *__restrict__ tiles_per_gauss, // [..., N] or [nnz]
     int64_t *__restrict__ isect_ids,       // [n_isects]
     int32_t *__restrict__ flatten_ids      // [n_isects]
@@ -76,11 +79,29 @@ __global__ void intersect_tile_kernel(
     tile_max.x = min(max(0, (uint32_t)ceil(tile_x + tile_radius_x)), tile_width);
     tile_max.y = min(max(0, (uint32_t)ceil(tile_y + tile_radius_y)), tile_height);
 
+    bool enable_cb = compact_box_beta > 0.0f && opacities != nullptr && conics != nullptr;
+
     if (first_pass) {
         // first pass only writes out tiles_per_gauss
-        tiles_per_gauss[idx] = static_cast<int32_t>(
-            (tile_max.y - tile_min.y) * (tile_max.x - tile_min.x)
-        );
+        if (enable_cb) {
+            int32_t count = 0;
+            const float opacity = opacities[idx];
+            const vec3 conic = glm::make_vec3(conics + 3 * idx);
+            const float max_mahalanobis_sq = 2.0f * compact_box_beta * __logf(opacity / ALPHA_THRESHOLD);
+            for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
+                for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
+                    if (inCompactBox(mean2d, conic, max_mahalanobis_sq, j, i, tile_size)) {
+                        ++count;
+                    }
+                }
+            }
+            tiles_per_gauss[idx] = count;
+        }
+        else {
+            tiles_per_gauss[idx] = static_cast<int32_t>(
+                (tile_max.y - tile_min.y) * (tile_max.x - tile_min.x)
+            );
+        }
         return;
     }
 
@@ -100,17 +121,39 @@ __global__ void intersect_tile_kernel(
     // int64_t depth_id_enc = (int64_t) * (int32_t *)&(depths[idx]);
     
     int64_t cur_idx = (idx == 0) ? 0 : cum_tiles_per_gauss[idx - 1];
-    for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
-        for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
-            int64_t tile_id = i * tile_width + j;
-            // e.g. tile_n_bits = 22:
-            // image id (10 bits) | tile id (22 bits) | depth (32 bits)
-            isect_ids[cur_idx] = iid_enc | (tile_id << 32) | depth_id_enc;
-            // the flatten index in [I * N] or [nnz]
-            flatten_ids[cur_idx] = static_cast<int32_t>(idx);
-            ++cur_idx;
+    if (enable_cb) {
+        const float opacity = opacities[idx];
+        const vec3 conic = glm::make_vec3(conics + 3 * idx);
+        const float max_mahalanobis_sq = 2.0f * compact_box_beta * __logf(opacity / ALPHA_THRESHOLD);
+        for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
+            for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
+                if (inCompactBox(mean2d, conic, max_mahalanobis_sq, j, i, tile_size)) {
+                    int64_t tile_id = i * tile_width + j;
+                    // e.g. tile_n_bits = 22:
+                    // image id (10 bits) | tile id (22 bits) | depth (32 bits)
+                    isect_ids[cur_idx] = iid_enc | (tile_id << 32) | depth_id_enc;
+                    // the flatten index in [I * N] or [nnz]
+                    flatten_ids[cur_idx] = static_cast<int32_t>(idx);
+                    ++cur_idx;
+                }
+            }
+        }
+    } else {
+        for (int32_t i = tile_min.y; i < tile_max.y; ++i) {
+            for (int32_t j = tile_min.x; j < tile_max.x; ++j) {
+                int64_t tile_id = i * tile_width + j;
+                // e.g. tile_n_bits = 22:
+                // image id (10 bits) | tile id (22 bits) | depth (32 bits)
+                isect_ids[cur_idx] = iid_enc | (tile_id << 32) | depth_id_enc;
+                // the flatten index in [I * N] or [nnz]
+                flatten_ids[cur_idx] = static_cast<int32_t>(idx);
+                ++cur_idx;
+            }
         }
     }
+
+
+    
 }
 
 void launch_intersect_tile_kernel(
@@ -120,6 +163,9 @@ void launch_intersect_tile_kernel(
     const at::Tensor depths,                     // [..., N] or [nnz]
     const at::optional<at::Tensor> image_ids,    // [nnz]
     const at::optional<at::Tensor> gaussian_ids, // [nnz]
+    const at::optional<at::Tensor> opacities,    // [..., N] or [nnz]
+    const at::optional<at::Tensor> conics,     // [..., N, 3] or [nnz, 3]
+    const float compact_box_beta,
     const uint32_t I,
     const uint32_t tile_size,
     const uint32_t tile_width,
@@ -184,6 +230,12 @@ void launch_intersect_tile_kernel(
                     means2d.data_ptr<scalar_t>(),
                     radii.data_ptr<int32_t>(),
                     depths.data_ptr<scalar_t>(),
+                    opacities.has_value()
+                        ? opacities.value().data_ptr<scalar_t>()
+                        : nullptr,
+                    conics.has_value()
+                        ? conics.value().data_ptr<scalar_t>()
+                        : nullptr,
                     cum_tiles_per_gauss.has_value()
                         ? cum_tiles_per_gauss.value().data_ptr<int64_t>()
                         : nullptr,
@@ -192,6 +244,7 @@ void launch_intersect_tile_kernel(
                     tile_height,
                     tile_n_bits,
                     image_n_bits,
+                    compact_box_beta,
                     tiles_per_gauss.has_value()
                         ? tiles_per_gauss.value().data_ptr<int32_t>()
                         : nullptr,

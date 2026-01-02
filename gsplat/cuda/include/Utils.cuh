@@ -771,7 +771,7 @@ inline __device__ vec3 safe_normalize_bw(const vec3 &v, const vec3 &d_out) {
     return d_out;
 }
 
-inline __device__ void computCompactBoxRange(
+inline __device__ void computeCompactBoxRange(
     // inputs
     const vec2 mean2d,
     const vec3 conic,
@@ -800,6 +800,49 @@ inline __device__ void computCompactBoxRange(
         sqrtf(max(0.f, max_mahalanobis_sq * conic[2] / det));
     radius_y =
         sqrtf(max(0.f, max_mahalanobis_sq * conic[0] / det));
+}
+
+inline __device__ float computeMahalanobisSq(
+    const float diff_x,
+    const float diff_y,
+    const vec3 conic
+) {
+    return conic[0] * diff_x * diff_x +
+           2.f * conic[1] * diff_x * diff_y +
+           conic[2] * diff_y * diff_y;
+}
+
+inline __device__ bool inCompactBox(
+    // inputs
+    const vec2 mean2d,
+    const vec3 conic,
+    const float mahalanobis_sq_thresh,
+    const int32_t curr_tile_x_idx,
+    const int32_t curr_tile_y_idx,
+    const uint32_t tile_size
+) {
+    // 判断当前tile是否是一个可以产生贡献的tile
+    // 如果当前tile的四个顶点都在mahalanobis距离的阈值之外，则认为该tile不会产生贡献
+    const float curr_tile_x_min = curr_tile_x_idx * tile_size;
+    const float curr_tile_x_max = curr_tile_x_min + tile_size;
+    const float curr_tile_y_min = curr_tile_y_idx * tile_size;
+    const float curr_tile_y_max = curr_tile_y_min + tile_size;
+
+    const float dx_min = curr_tile_x_min - mean2d.x;
+    const float dx_max = curr_tile_x_max - mean2d.x;
+    const float dy_min = curr_tile_y_min - mean2d.y;
+    const float dy_max = curr_tile_y_max - mean2d.y;
+
+    if (computeMahalanobisSq(dx_min, dy_min, conic) <= mahalanobis_sq_thresh)
+        return true;
+    if (computeMahalanobisSq(dx_min, dy_max, conic) <= mahalanobis_sq_thresh)
+        return true;
+    if (computeMahalanobisSq(dx_max, dy_min, conic) <= mahalanobis_sq_thresh)
+        return true;
+    if (computeMahalanobisSq(dx_max, dy_max, conic) <= mahalanobis_sq_thresh)
+        return true;
+
+    return false;
 }
 
 } // namespace gsplat
