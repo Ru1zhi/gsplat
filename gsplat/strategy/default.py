@@ -275,8 +275,16 @@ class DefaultStrategy(Strategy):
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
+        if self.scale_act_type == "exp":
+            scale_act_fn = torch.exp
+        elif self.scale_act_type == "softplus":
+            scale_act_fn = torch.nn.functional.softplus
+        else:
+            raise ValueError(
+                f"Unsupported scale activation type: {self.scale_act_type}"
+            )
         is_small = (
-            torch.exp(params["scales"]).max(dim=-1).values
+            scale_act_fn(params["scales"]).max(dim=-1).values
             <= self.grow_scale3d * state["scene_scale"]
         )
         is_dupli = is_grad_high & is_small

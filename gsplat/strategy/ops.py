@@ -120,10 +120,6 @@ def duplicate(
             state[k] = torch.cat((v, v[sel]))
 
 
-def _softplus(x: Tensor) -> Tensor:
-    return F.softplus(x)
-
-
 def _inverse_softplus(x: Tensor) -> Tensor:
     return torch.log(torch.exp(x) - 1)
 
@@ -150,7 +146,7 @@ def split(
         scale_act_fn = torch.exp
         inv_scale_act_fn = torch.log
     elif scale_act_type == "softplus":
-        scale_act_fn = _softplus
+        scale_act_fn = F.softplus
         inv_scale_act_fn = _inverse_softplus
     else:
         raise ValueError(f"Unsupported scale activation type: {scale_act_type}")
