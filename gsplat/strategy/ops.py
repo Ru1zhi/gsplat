@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Union, Literal
 
 import torch
 import torch.nn.functional as F
@@ -120,6 +120,14 @@ def duplicate(
             state[k] = torch.cat((v, v[sel]))
 
 
+def _softplus(x: Tensor) -> Tensor:
+    return F.softplus(x)
+
+
+def _inverse_softplus(x: Tensor) -> Tensor:
+    return torch.log(torch.exp(x) - 1)
+
+
 @torch.no_grad()
 def split(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -127,6 +135,7 @@ def split(
     state: Dict[str, Tensor],
     mask: Tensor,
     revised_opacity: bool = False,
+    scale_act_type: Literal["exp", "softplus"] = "exp",
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -137,11 +146,20 @@ def split(
         revised_opacity: Whether to use revised opacity formulation
           from arXiv:2404.06109. Default: False.
     """
+    if scale_act_type == "exp":
+        scale_act_fn = torch.exp
+        inv_scale_act_fn = torch.log
+    elif scale_act_type == "softplus":
+        scale_act_fn = _softplus
+        inv_scale_act_fn = _inverse_softplus
+    else:
+        raise ValueError(f"Unsupported scale activation type: {scale_act_type}")
+
     device = mask.device
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
 
-    scales = torch.exp(params["scales"][sel])
+    scales = scale_act_fn(params["scales"][sel])
     quats = F.normalize(params["quats"][sel], dim=-1)
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
     samples = torch.einsum(
@@ -156,7 +174,7 @@ def split(
         if name == "means":
             p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
         elif name == "scales":
-            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            p_split = inv_scale_act_fn(scales / 1.6).repeat(2, 1)  # [2N, 3]
         elif name == "opacities" and revised_opacity:
             new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
             p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]

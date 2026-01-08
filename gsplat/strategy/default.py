@@ -58,6 +58,8 @@ class DefaultStrategy(Strategy):
         key_for_gradient (str): Which variable uses for densification strategy.
           3DGS uses "means2d" gradient and 2DGS uses a similar gradient which stores
           in variable "gradient_2dgs".
+        scale_act_type (str): The activation function for the scale parameter.
+          Can be "exp" or "softplus". Default is "exp".
 
     Examples:
 
@@ -92,6 +94,7 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    scale_act_type: Literal["exp", "softplus"] = "exp"
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -305,6 +308,7 @@ class DefaultStrategy(Strategy):
                 state=state,
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
+                scale_act_type=self.scale_act_type,
             )
         return n_dupli, n_split
 
