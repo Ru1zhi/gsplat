@@ -34,7 +34,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
-    at::Tensor last_ids // [..., image_height, image_width]
+    at::Tensor last_ids, // [..., image_height, image_width]
+    at::optional<at::Tensor> visible_marks // [N]
 );
 
 template <uint32_t CDIM>

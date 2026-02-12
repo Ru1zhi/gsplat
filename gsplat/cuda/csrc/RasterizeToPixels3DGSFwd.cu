@@ -36,7 +36,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [I, image_height, image_width]
+    int32_t *__restrict__ last_ids,        // [I, image_height, image_width]
+    bool *__restrict__ visible_marks    // [I, N]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -47,6 +48,12 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         block.group_index().y * tile_width + block.group_index().z;
     uint32_t i = block.group_index().y * tile_size + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_size + block.thread_index().x;
+
+    bool return_visiblity = false;
+    if (!packed && visible_marks != nullptr) {
+        // Only the non-packed mode supports visibility return for now
+        return_visiblity = true;
+    }
 
     tile_offsets += image_id * tile_height * tile_width;
     render_colors += image_id * image_height * image_width * CDIM;
@@ -165,6 +172,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             }
             cur_idx = batch_start + t;
 
+            if (return_visiblity) {
+                // mark this gaussian as visible
+                visible_marks[image_id * N + g] = true;
+            }
+
             T = next_T;
         }
     }
@@ -206,7 +218,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
-    at::Tensor last_ids // [..., image_height, image_width]
+    at::Tensor last_ids, // [..., image_height, image_width]
+    at::optional<at::Tensor> visible_marks // [..., N]
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -261,7 +274,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            visible_marks.has_value() ? visible_marks.value().data_ptr<bool>() : nullptr
         );
 }
 
@@ -283,7 +297,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
-        at::Tensor last_ids                                                    \
+        at::Tensor last_ids,                                                   \
+        at::optional<at::Tensor> visible_marks                                 \
     );
 
 __INS__(1)

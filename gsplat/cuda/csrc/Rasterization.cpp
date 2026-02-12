@@ -17,7 +17,7 @@ namespace gsplat {
 // 3DGS
 ////////////////////////////////////////////////////
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::optional<at::Tensor>> rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
     const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
@@ -31,7 +31,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,   // [n_isects]
+    const bool mark_visible_gaussians // whether to output the visible_marks
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -63,6 +64,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     last_ids_dims.append({image_height, image_width});
     at::Tensor last_ids = at::empty(last_ids_dims, opt.dtype(at::kInt));
 
+    at::optional<at::Tensor> visible_marks = c10::nullopt;
+    if (mark_visible_gaussians) {
+        // return a [..., N] boolean mask indicating which gaussians are visible in the final render
+        at::DimVector visible_marks_dims(means2d.sizes().slice(0, means2d.dim() - 2));
+        visible_marks_dims.append({means2d.size(-2)});
+        // Initialize to false, and the kernel will set to true for visible gaussians.
+        visible_marks = at::zeros(visible_marks_dims, opt.dtype(at::kBool));
+    }
+
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
         launch_rasterize_to_pixels_3dgs_fwd_kernel<N>(                         \
@@ -79,7 +89,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             flatten_ids,                                                       \
             renders,                                                           \
             alphas,                                                            \
-            last_ids                                                           \
+            last_ids,                                                          \
+            visible_marks                                                      \
         );                                                                     \
         break;
 
@@ -111,7 +122,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     }
 #undef __LAUNCH_KERNEL__
 
-    return std::make_tuple(renders, alphas, last_ids);
+    return std::make_tuple(renders, alphas, last_ids, visible_marks);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
