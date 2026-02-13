@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from typing_extensions import Literal
 
 from .base import Strategy
@@ -92,6 +93,7 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    use_ddp: bool = False
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -268,7 +270,13 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> Tuple[int, int]:
         count = state["count"]
-        grads = state["grad2d"] / count.clamp_min(1)
+        grads = state["grad2d"]
+        if self.use_ddp:
+            # In DDP mode, we need to aggregate the grad2d and count from all processes
+            dist.all_reduce(grads, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+
+        grads = grads / count.clamp_min(1)
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
@@ -282,7 +290,10 @@ class DefaultStrategy(Strategy):
         is_large = ~is_small
         is_split = is_grad_high & is_large
         if step < self.refine_scale2d_stop_iter:
-            is_split |= state["radii"] > self.grow_scale2d
+            radii = state["radii"]
+            if self.use_ddp:
+                dist.all_reduce(radii, op=dist.ReduceOp.MAX)
+            is_split |= radii > self.grow_scale2d
         n_split = is_split.sum().item()
 
         # first duplicate
@@ -328,7 +339,10 @@ class DefaultStrategy(Strategy):
             # We implement it here for completeness but set `refine_scale2d_stop_iter`
             # to 0 by default to disable it.
             if step < self.refine_scale2d_stop_iter:
-                is_too_big |= state["radii"] > self.prune_scale2d
+                radii = state["radii"]
+                if self.use_ddp:
+                    dist.all_reduce(radii, op=dist.ReduceOp.MAX)
+                is_too_big |= radii > self.prune_scale2d
 
             is_prune = is_prune | is_too_big
 
