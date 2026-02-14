@@ -317,6 +317,10 @@ class DefaultStrategy(Strategy):
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
             )
+
+        if self.use_ddp:
+            dist.barrier()
+
         return n_dupli, n_split
 
     @torch.no_grad()
@@ -349,5 +353,8 @@ class DefaultStrategy(Strategy):
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+
+        if self.use_ddp:
+            dist.barrier()
 
         return n_prune
