@@ -1429,6 +1429,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
