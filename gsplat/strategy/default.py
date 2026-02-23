@@ -93,7 +93,8 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
-    use_ddp: bool = False
+    distributed: bool = False
+    random_seed: int = 42
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -271,7 +272,7 @@ class DefaultStrategy(Strategy):
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"]
-        if self.use_ddp:
+        if self.distributed:
             # In DDP mode, we need to aggregate the grad2d and count from all processes
             dist.all_reduce(grads, op=dist.ReduceOp.SUM)
             dist.all_reduce(count, op=dist.ReduceOp.SUM)
@@ -285,15 +286,20 @@ class DefaultStrategy(Strategy):
             <= self.grow_scale3d * state["scene_scale"]
         )
         is_dupli = is_grad_high & is_small
+        if self.distributed:
+            # we need to synchronize the decision of duplication to avoid divergence across processes.
+            dist.all_reduce(is_dupli, op=dist.ReduceOp.MAX)
         n_dupli = is_dupli.sum().item()
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
         if step < self.refine_scale2d_stop_iter:
             radii = state["radii"]
-            if self.use_ddp:
+            if self.distributed:
                 dist.all_reduce(radii, op=dist.ReduceOp.MAX)
             is_split |= radii > self.grow_scale2d
+        if self.distributed:
+            dist.all_reduce(is_split, op=dist.ReduceOp.MAX)
         n_split = is_split.sum().item()
 
         # first duplicate
@@ -310,16 +316,21 @@ class DefaultStrategy(Strategy):
 
         # then split
         if n_split > 0:
+            if self.distributed:
+                # Make sure the randomness is the same across processes to avoid divergence.
+                rng = torch.Generator(device=device)
+                rng.manual_seed(self.random_seed + step)
+            else:
+                rng = None
+
             split(
                 params=params,
                 optimizers=optimizers,
                 state=state,
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
+                rng=rng,
             )
-
-        if self.use_ddp:
-            dist.barrier()
 
         return n_dupli, n_split
 
@@ -344,17 +355,16 @@ class DefaultStrategy(Strategy):
             # to 0 by default to disable it.
             if step < self.refine_scale2d_stop_iter:
                 radii = state["radii"]
-                if self.use_ddp:
+                if self.distributed:
                     dist.all_reduce(radii, op=dist.ReduceOp.MAX)
                 is_too_big |= radii > self.prune_scale2d
 
             is_prune = is_prune | is_too_big
+            if self.distributed:
+                dist.all_reduce(is_prune, op=dist.ReduceOp.MAX)
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
-
-        if self.use_ddp:
-            dist.barrier()
 
         return n_prune
