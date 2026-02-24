@@ -1,6 +1,6 @@
-from typing import Callable, Dict, List, Optional, Union
-
 import numpy as np
+from typing import Callable, Dict, List, Union
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -127,7 +127,6 @@ def split(
     state: Dict[str, Tensor],
     mask: Tensor,
     revised_opacity: bool = False,
-    rng: Optional[torch.Generator] = None,
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -149,11 +148,7 @@ def split(
         "nij,nj,bnj->bni",
         rotmats,
         scales,
-        (
-            torch.randn(2, len(scales), 3, device=device)
-            if rng is None
-            else torch.randn(2, len(scales), 3, generator=rng, device=device)
-        ),
+        torch.randn(2, len(scales), 3, device=device),
     )  # [2, N, 3]
 
     def param_fn(name: str, p: Tensor) -> Tensor:
